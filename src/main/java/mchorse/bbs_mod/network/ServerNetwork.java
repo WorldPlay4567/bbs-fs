@@ -3,6 +3,8 @@ package mchorse.bbs_mod.network;
 import mchorse.bbs_mod.BBSMod;
 import mchorse.bbs_mod.actions.ActionManager;
 import mchorse.bbs_mod.actions.ActionPlayer;
+import mchorse.bbs_mod.film.RecordingManager;
+import mchorse.bbs_mod.film.RecordingSession;
 import mchorse.bbs_mod.film.replays.Inventory;
 import mchorse.bbs_mod.actions.ActionRecorder;
 import mchorse.bbs_mod.actions.ActionState;
@@ -39,11 +41,13 @@ import net.minecraft.network.PacketByteBuf;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.network.ServerPlayerEntity;
 import net.minecraft.server.world.ServerWorld;
+import net.minecraft.text.Text;
 import net.minecraft.util.Identifier;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.world.World;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -72,6 +76,7 @@ public class ServerNetwork
     public static final Identifier CLIENT_ANIMATION_STATE_MODEL_BLOCK_TRIGGER = new Identifier(BBSMod.MOD_ID, "c16");
     public static final Identifier CLIENT_REFRESH_MODEL_BLOCKS = new Identifier(BBSMod.MOD_ID, "c17");
     public static final Identifier CLIENT_REQUEST_FILM_RESYNC = new Identifier(BBSMod.MOD_ID, "c18");
+    public static final Identifier CLIENT_RECORD_START_RESULT = new Identifier(BBSMod.MOD_ID, "c19");
 
     public static final Identifier SERVER_MODEL_BLOCK_FORM_PACKET = new Identifier(BBSMod.MOD_ID, "s1");
     public static final Identifier SERVER_MODEL_BLOCK_TRANSFORMS_PACKET = new Identifier(BBSMod.MOD_ID, "s2");
@@ -87,6 +92,9 @@ public class ServerNetwork
     public static final Identifier SERVER_ZOOM = new Identifier(BBSMod.MOD_ID, "s12");
     public static final Identifier SERVER_PAUSE_FILM = new Identifier(BBSMod.MOD_ID, "s13");
     public static final Identifier SERVER_APPLY_FILM_PLAYER_SETTINGS = new Identifier(BBSMod.MOD_ID, "s14");
+    public static final Identifier SERVER_START_RECORDING = new Identifier(BBSMod.MOD_ID, "s15");
+    public static final Identifier SERVER_FRAME_DATA = new Identifier(BBSMod.MOD_ID, "s16");
+    public static final Identifier SERVER_STOP_RECORDING = new Identifier(BBSMod.MOD_ID, "s17");
 
     private static ServerPacketCrusher crusher = new ServerPacketCrusher();
 
@@ -111,6 +119,11 @@ public class ServerNetwork
         ServerPlayNetworking.registerGlobalReceiver(SERVER_ZOOM, (server, player, handler, buf, responder) -> handleZoomPacket(server, player, buf));
         ServerPlayNetworking.registerGlobalReceiver(SERVER_PAUSE_FILM, (server, player, handler, buf, responder) -> handlePauseFilmPacket(server, player, buf));
         ServerPlayNetworking.registerGlobalReceiver(SERVER_APPLY_FILM_PLAYER_SETTINGS, (server, player, handler, buf, responder) -> handleApplyFilmPlayerSettings(server, player, buf));
+
+        /* New recording network handlers */
+        ServerPlayNetworking.registerGlobalReceiver(SERVER_START_RECORDING, (server, player, handler, buf, responder) -> handleStartRecording(server, player, buf));
+        ServerPlayNetworking.registerGlobalReceiver(SERVER_FRAME_DATA, (server, player, handler, buf, responder) -> handleFrameData(server, player, buf));
+        ServerPlayNetworking.registerGlobalReceiver(SERVER_STOP_RECORDING, (server, player, handler, buf, responder) -> handleStopRecording(server, player, buf));
     }
 
     /* Handlers */
@@ -570,6 +583,139 @@ public class ServerNetwork
         });
     }
 
+    /* Recording handlers (new) */
+
+    private static void handleStartRecording(MinecraftServer server, ServerPlayerEntity player, PacketByteBuf buf)
+    {
+        if (!PermissionUtils.arePanelsAllowed(server, player))
+        {
+            return;
+        }
+
+        String target = buf.readString();
+
+        server.execute(() ->
+        {
+            RecordingSession session = RecordingManager.startSession(player, target);
+            PacketByteBuf out = PacketByteBufs.create();
+
+            if (session == null)
+            {
+                UUID owner = RecordingManager.getActiveOwner(target);
+                String ownerName = "unknown";
+
+                if (owner != null)
+                {
+                    ServerPlayerEntity ownerPlayer = server.getPlayerManager().getPlayer(owner);
+
+                    if (ownerPlayer != null)
+                    {
+                        ownerName = ownerPlayer.getName().getString();
+                    }
+                }
+
+                out.writeBoolean(false);
+                out.writeString("Target is already being recorded by " + ownerName);
+
+                ServerPlayNetworking.send(player, CLIENT_RECORD_START_RESULT, out);
+                player.sendMessage(Text.literal("Recording denied: target already recorded by " + ownerName), false);
+                System.out.println("[BBS] Recording denied for player " + player.getName().getString() + " on target " + target + " (owner: " + ownerName + ")");
+            }
+            else
+            {
+                out.writeBoolean(true);
+                out.writeUuid(session.sessionId);
+
+                ServerPlayNetworking.send(player, CLIENT_RECORD_START_RESULT, out);
+                player.sendMessage(Text.literal("Recording started: " + session.sessionId.toString()), false);
+                System.out.println("[BBS] Recording started: " + session.sessionId + " by " + player.getName().getString() + " target=" + target);
+            }
+        });
+    }
+
+    private static void handleFrameData(MinecraftServer server, ServerPlayerEntity player, PacketByteBuf buf)
+    {
+        if (!PermissionUtils.arePanelsAllowed(server, player))
+        {
+            return;
+        }
+
+        try
+        {
+            UUID sessionId = buf.readUuid();
+            int tick = buf.readInt();
+            double x = buf.readDouble();
+            double y = buf.readDouble();
+            double z = buf.readDouble();
+            float yaw = buf.readFloat();
+            float pitch = buf.readFloat();
+            int mw = buf.readInt();
+            Map<String, Float> morphWeights = new HashMap<>();
+
+            for (int i = 0; i < mw; i++)
+            {
+                String key = buf.readString();
+                float val = buf.readFloat();
+                morphWeights.put(key, val);
+            }
+
+            server.execute(() ->
+            {
+                boolean ok = RecordingManager.addFrame(sessionId, player.getUuid(), tick, x, y, z, yaw, pitch, morphWeights);
+
+                if (!ok)
+                {
+                    // optionally notify player
+                    // player.sendMessage(Text.literal("Frame rejected"), false);
+                }
+            });
+        }
+        catch (Exception e)
+        {
+            e.printStackTrace();
+        }
+    }
+
+    private static void handleStopRecording(MinecraftServer server, ServerPlayerEntity player, PacketByteBuf buf)
+    {
+        if (!PermissionUtils.arePanelsAllowed(server, player))
+        {
+            return;
+        }
+
+        try
+        {
+            UUID sessionId = buf.readUuid();
+
+            server.execute(() ->
+            {
+                RecordingSession session = RecordingManager.stopSession(sessionId);
+
+                if (session == null)
+                {
+                    player.sendMessage(Text.literal("No active recording with given id."), false);
+                    System.out.println("[BBS] Stop recording failed: no session " + sessionId + " from " + player.getName().getString());
+                }
+                else if (!session.owner.equals(player.getUuid()))
+                {
+                    player.sendMessage(Text.literal("You are not the owner of this recording."), false);
+                    System.out.println("[BBS] Stop recording denied: player " + player.getName().getString() + " is not owner of " + sessionId);
+                }
+                else
+                {
+                    player.sendMessage(Text.literal("Recording stopped: " + sessionId.toString()), false);
+                    System.out.println("[BBS] Recording stopped: " + sessionId + " by " + player.getName().getString());
+
+                    // TODO: serialize session.frames into Film/Replay or save to disk
+                }
+            });
+        }
+        catch (Exception e)
+        {
+            e.printStackTrace();
+        }
+    }
+
     /* API */
 
     public static void sendMorph(ServerPlayerEntity player, int playerId, Form form)
@@ -725,8 +871,7 @@ public class ServerNetwork
 
     public static void sendSharedForm(ServerPlayerEntity player, MapType data)
     {
-        crusher.send(player, CLIENT_SHARED_FORM, data, (packetByteBuf) ->
-        {});
+        crusher.send(player, CLIENT_SHARED_FORM, data, (packetByteBuf) -> {});
     }
 
     public static void sendEntityForm(ServerPlayerEntity player, IEntityFormProvider actor)
